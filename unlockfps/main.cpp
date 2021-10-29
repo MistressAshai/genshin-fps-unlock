@@ -1,6 +1,9 @@
 #define KEY_TOGGLE VK_END
 #define KEY_INCREASE VK_UP
+#define KEY_INCREASE_SMALL VK_RIGHT
 #define KEY_DECREASE VK_DOWN
+#define KEY_DECREASE_SMALL VK_LEFT
+#define KEY_COMBO VK_HOME
 #define FPS_TARGET 120
 
 // do not touch anything below
@@ -16,8 +19,11 @@
 #include <string>
 #include <thread>
 #include <Psapi.h>
+#include "inireader.h"
 
 bool bStop = false;
+std::string GamePath{};
+int FpsValue = FPS_TARGET;
 
 // didnt made this pattern scan - c+p'd from somewhere
 uintptr_t PatternScan(void* module, const char* signature)
@@ -118,10 +124,33 @@ DWORD GetPID(std::string ProcessName)
     return pid;
 }
 
-std::string ReadConfig()
+bool WriteConfig(std::string GamePath, int fps)
 {
-    HANDLE hFile = CreateFileA("config", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE hFile = CreateFileA("config.ini", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE)
+    {
+        DWORD code = GetLastError();
+        printf("CreateFileA failed (%d): %s\n", code, GetLastErrorAsString(code).c_str());
+        return false;
+    }
+
+    std::string content{};
+    content = "[Setting]\n";
+    content += "Path=" + GamePath + "\n";
+    content += "FPS=" + std::to_string(fps);
+
+    DWORD written = 0;
+    WriteFile(hFile, content.data(), content.size(), &written, nullptr);
+    CloseHandle(hFile);
+}
+
+void LoadConfig()
+{
+    if (GetFileAttributesA("config") != INVALID_FILE_ATTRIBUTES)
+        DeleteFileA("config");
+
+    INIReader reader("config.ini");
+    if (reader.ParseError() != 0) 
     {
         printf("Config not found - Starting first time setup\nPlease leave this open and start the game\nThis only need to be done once\n\n");
         printf("Waiting for game...\n");
@@ -133,14 +162,11 @@ std::string ReadConfig()
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
 
         char szPath[MAX_PATH]{};
-        K32GetModuleFileNameExA(hProcess, nullptr, szPath, sizeof(szPath));
+        DWORD length = sizeof(szPath);
+        QueryFullProcessImageNameA(hProcess, 0, szPath, &length);
 
-        // this shouldn't fail
-        hFile = CreateFileA("config", GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-
-        DWORD written = 0;
-        WriteFile(hFile, szPath, strlen(szPath), &written, nullptr);
-        CloseHandle(hFile);
+        GamePath = szPath;
+        WriteConfig(GamePath, FpsValue);
 
         HWND hwnd = nullptr;
         while (!(hwnd = FindWindowA("UnityWndClass", nullptr)))
@@ -159,28 +185,18 @@ std::string ReadConfig()
         CloseHandle(hProcess);
 
         system("cls");
-        return szPath;
+        return;
     }
 
-    DWORD FileSize = GetFileSize(hFile, nullptr);
+    GamePath = reader.Get("Setting", "Path", "");
+    FpsValue = reader.GetInteger("Setting", "FPS", FpsValue);
 
-    std::string buf;
-    buf.reserve(MAX_PATH);
-    ZeroMemory(buf.data(), MAX_PATH);
-
-    DWORD read = 0;
-    ReadFile(hFile, buf.data(), FileSize, &read, nullptr);
-    CloseHandle(hFile);
-
-    // check if the path is valid - if not then redo the setup again
-    if (GetFileAttributesA(buf.c_str()) == INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesA(GamePath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         printf("Looks like you've moved your game somewhere else - Lets setup again\n");
-        DeleteFileA("config");
-        return ReadConfig();
+        DeleteFileA("config.ini");
+        LoadConfig();
     }
-
-    return buf.c_str();
 }
 
 void InjectReshade(HANDLE hProcess)
@@ -227,24 +243,25 @@ DWORD __stdcall Thread1(LPVOID p)
     if (!p)
         return 0;
 
-    HWND hwnd = nullptr;
-    while (!(hwnd = FindWindowA("UnityWndClass", nullptr)))
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
     int* pTargetFPS = (int*)p;
     int fps = *pTargetFPS;
     int prev = fps;
     while (!bStop)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
-        if (GetForegroundWindow() != hwnd)
-            continue;
-        if (GetAsyncKeyState(KEY_DECREASE) & 1)
+        bool comboPressed = GetAsyncKeyState(KEY_COMBO) & 0x8000;
+        if (comboPressed && GetAsyncKeyState(KEY_DECREASE) & 1)
             fps -= 20;
-        if (GetAsyncKeyState(KEY_INCREASE) & 1)
+        if (comboPressed && GetAsyncKeyState(KEY_DECREASE_SMALL) & 1)
+            fps -= 2;
+        if (comboPressed && GetAsyncKeyState(KEY_INCREASE) & 1)
             fps += 20;
-        if (GetAsyncKeyState(KEY_TOGGLE) & 1)
+        if (comboPressed && GetAsyncKeyState(KEY_INCREASE_SMALL) & 1)
+            fps += 2;
+        if (comboPressed && GetAsyncKeyState(KEY_TOGGLE)  & 1)
             fps = fps != 60 ? 60 : prev;
+        if (prev != fps)
+            WriteConfig(GamePath, fps);
         if (fps > 60)
             prev = fps;
         if (fps < 60)
@@ -263,20 +280,20 @@ int main(int argc, char** argv)
     });
 
     SetConsoleTitleA("");
-    int TargetFPS = FPS_TARGET;
 
     std::string CommandLine{};
     if (argc > 1)
     {
-        CommandLine = GetCommandLineA();
-        CommandLine = CommandLine.substr(CommandLine.find_first_of(' ') + 2);
+        for (int i = 1; i < argc; i++)
+            CommandLine += argv[i] + std::string(" ");
     }
     
-    // read path from config
-    std::string ProcessPath = ReadConfig();
+    LoadConfig();
+    int TargetFPS = FpsValue;
+    std::string ProcessPath = GamePath;
     std::string ProcessDir{};
 
-    printf("FPS Unlocker v1.3.2\n");
+    printf("FPS Unlocker v1.4.1\n");
     printf("Game: %s\n\n", ProcessPath.c_str());
     ProcessDir = ProcessPath.substr(0, ProcessPath.find_last_of("\\"));
 
@@ -362,6 +379,11 @@ int main(int argc, char** argv)
 
     VirtualFree(mem, 0, MEM_RELEASE);
     printf("Done\n\n");
+    printf("Use arrow keys to change limit:\n");
+    printf("  HOME+UP:    +20\n");
+    printf("  HOME+DOWN:  -20\n");
+    printf("  HOME+LEFT:  -2\n");
+    printf("  HOME+RIGHT: +2\n\n");
 
     // keybinds thread
     HANDLE hThread = CreateThread(nullptr, 0, Thread1, &TargetFPS, 0, nullptr);
